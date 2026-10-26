@@ -3,7 +3,7 @@ import sys
 
 
 async def console(app):
-    print(f"{app.name} працює. Формат: <id> /команда ...   (Ctrl+D вихід)")
+    print(f"{app.name} працює. Формат: <id> /команда ...   (Ctrl+Z, Enter: вихід)")
     while True:
         line = await asyncio.to_thread(sys.stdin.readline)
         if not line:
@@ -14,3 +14,5 @@ async def console(app):
             continue
         for msg in await app.handle(int(uid), text):
             print("  бот:", msg)
+            for row in msg.buttons:
+                print("      ", "  ".join(f"[{label} → {cmd}]" for label, cmd in row))

@@ -10,18 +10,29 @@ from .common import ROLES, UserError
 log = logging.getLogger("botfab")
 
 
+class Msg:
+    """Одна відповідь бота: текст + кнопки (рядки пар «підпис, команда»)."""
+
+    def __init__(self, text, buttons=None):
+        self.text, self.buttons = text, buttons or []
+
+    def __str__(self):
+        return self.text
+
+
 class Ctx:
     """Відповіді збираються тут; адаптер платформи сам вирішує, як їх показати."""
 
     def __init__(self, user_id, role):
         self.user_id, self.role, self.out = user_id, role, []
 
-    async def reply(self, text):
-        self.out.append(text)
+    async def reply(self, text, buttons=None):
+        self.out.append(Msg(text, buttons))
 
-    async def show(self, rows):
-        self.out.append("\n".join("• " + " | ".join(map(str, r)) for r in rows)
-                        if rows else "Нічого не знайдено.")
+    async def show(self, rows, buttons=None):
+        text = ("\n".join("• " + " | ".join(map(str, r)) for r in rows)
+                if rows else "Нічого не знайдено.")
+        self.out.append(Msg(text, buttons))
 
 
 class Store:
@@ -73,7 +84,7 @@ class Runtime:
         self._hits = defaultdict(lambda: deque(maxlen=5))
         self._undo = defaultdict(list)
         self._redo = defaultdict(list)
-        
+
 
     def store(self, name, fields):
         return Store(self, name, fields)
@@ -148,4 +159,4 @@ class Runtime:
         except Exception:
             log.exception("[%s] збій cmd=%s", trace, text)  # деталі лише в лог
             ctx.out.append(f"Щось пішло не так. Код помилки: {trace}")
-        return ctx.out
+        return [m if isinstance(m, Msg) else Msg(m) for m in ctx.out]

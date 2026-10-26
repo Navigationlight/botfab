@@ -5,7 +5,7 @@ store files:
     name, tag, folder
 
 roles:
-    owner 2
+    owner 5218929723
 
 command "add" with name tag:
     only for member
