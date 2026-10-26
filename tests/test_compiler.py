@@ -21,3 +21,11 @@ def test_all_errors_at_once():
     )
     _, errors = check(src)
     assert len(errors) == 2
+def test_card_button_unknown_command():
+    src = (
+        'store files:\n    name\n\n'
+        'command "remove" with name:\n    delete files where name is name\n\n'
+        'card files:\n    button "x" runs remov\n'
+    )
+    _, errors = check(src)
+    assert "remove" in errors[0]

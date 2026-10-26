@@ -79,15 +79,17 @@ class Store:
 class Runtime:
     def __init__(self, name, db):
         self.name, self.roles, self.commands = name, {}, {}
+        self.stores, self.card_defs = {}, {}
         self.conn = sqlite3.connect(db, check_same_thread=False)
         self._lock = asyncio.Lock()
         self._hits = defaultdict(lambda: deque(maxlen=5))
         self._undo = defaultdict(list)
         self._redo = defaultdict(list)
 
-
     def store(self, name, fields):
-        return Store(self, name, fields)
+        s = Store(self, name, fields)
+        self.stores[name] = s
+        return s
 
     def command(self, name, args, role):
         def deco(fn):
@@ -111,6 +113,7 @@ class Runtime:
             return False
         q.append(now)
         return True
+
     def remember(self, uid, undo, redo):
         self._undo[uid].append((undo, redo))
         self._redo[uid].clear()
@@ -122,7 +125,7 @@ class Runtime:
         for sql, p in undo:
             await self.run(sql, p)
         self._redo[ctx.user_id].append((undo, redo))
-        ctx.out.append("Скасовано.")
+        ctx.out.append(Msg("Скасовано."))
 
     async def redo(self, ctx):
         if not self._redo[ctx.user_id]:
@@ -131,8 +134,27 @@ class Runtime:
         for sql, p in redo:
             await self.run(sql, p)
         self._undo[ctx.user_id].append((undo, redo))
-        ctx.out.append("Повернуто.")
+        ctx.out.append(Msg("Повернуто."))
 
+    async def cards(self, ctx, table, rows):
+        """Показує знайдені записи як картки з кнопками (до 5 штук)."""
+        card = self.card_defs.get(table)
+        if not card or not rows:
+            return await ctx.show(rows)
+        fields = self.stores[table].fields
+        for row in rows[:5]:
+            rec = dict(zip(fields, row))
+            lines = [f"{f}: {rec[f]}" for f in card["show"]]
+            if card["title"]:
+                lines.insert(0, str(rec[card["title"]]))
+            btns = []
+            for label, cmd, fixed in card["buttons"]:
+                args = self.commands[cmd][0]
+                vals = [str(fixed[a]) if a in fixed else str(rec[a]) for a in args]
+                btns.append((label, "/" + " ".join([cmd] + vals)))
+            ctx.out.append(Msg("\n".join(lines), [btns[i:i + 2] for i in range(0, len(btns), 2)]))
+        if len(rows) > 5:
+            ctx.out.append(Msg(f"Показано 5 з {len(rows)}. Уточни пошук."))
 
     async def handle(self, uid, text):
         ctx = Ctx(uid, self.roles.get(uid, "guest"))

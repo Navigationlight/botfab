@@ -6,6 +6,7 @@ store files:
 
 roles:
     owner 5218929723
+    owner 2
 
 command "add" with name tag:
     only for member
@@ -39,3 +40,8 @@ command "undo":
 command "redo":
     only for member
     redo
+card files:
+    title name
+    show tag, folder
+    button "🗑 Delete" runs remove
+    button "📥 To archive" runs move with folder = "archive"

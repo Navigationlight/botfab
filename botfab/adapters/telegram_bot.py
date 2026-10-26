@@ -5,12 +5,14 @@ from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filt
 
 
 def markup(buttons):
-    """Рядки пар (підпис, команда) -> inline-кнопки Telegram."""
-    if not buttons:
-        return None
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(label, callback_data=cmd[:64]) for label, cmd in row]
-         for row in buttons])
+    """Рядки пар (підпис, команда) -> inline-кнопки Telegram (команда до 64 байтів)."""
+    rows = []
+    for row in buttons or []:
+        r = [InlineKeyboardButton(label, callback_data=cmd)
+             for label, cmd in row if len(cmd.encode("utf-8")) <= 64]
+        if r:
+            rows.append(r)
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 def run_telegram(core, token):
@@ -34,4 +36,3 @@ def run_telegram(core, token):
     tg.add_handler(CallbackQueryHandler(on_button))
     print(f"{core.name} працює в Telegram. Зупинка: Ctrl+C")
     tg.run_polling()
-    

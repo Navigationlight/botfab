@@ -2,7 +2,7 @@ import re
 
 from .common import ROLES, CompileError, suggest
 
-TOP = ["bot", "database", "store", "roles", "command"]
+TOP = ["bot", "database", "store", "roles", "command", "card"]
 STATEMENTS = ["only", "find", "show", "add", "reply", "delete", "rename", "move", "undo", "redo"]
 
 
@@ -24,7 +24,7 @@ def split_blocks(src):
 
 def compile_command(n, name, args, body, stores):
     """Повертає (код, помилки). Збирає помилки з усіх рядків команди."""
-    role, out, found = "member", [], False  # за замовчуванням закрито для гостей
+    role, out, found, found_table = "member", [], False, None  # за замовчуванням закрито для гостей
     errors = []
 
     def val(tok, ln):
@@ -70,12 +70,16 @@ def compile_command(n, name, args, body, stores):
                 fields(fs, table(t, ln), ln)
                 val(a, ln)
                 out.append(f"found = await {t}.search({fs!r}, {a})")
-                found = True
+                found, found_table = True, t
             elif kw == "show":
-                if s != "show found" or not found:
+                m = re.fullmatch(r"show found( as cards)?", s)
+                if not m or not found:
                     raise CompileError(ln, "нема що показувати",
-                                       "спочатку зроби find, потім: show found")
-                out.append("await ctx.show(found)")
+                                       "спочатку find, потім: show found  або  show found as cards")
+                if m.group(1):
+                    out.append(f"await app.cards(ctx, {found_table!r}, found)")
+                else:
+                    out.append("await ctx.show(found)")
             elif kw == "add":
                 m = re.fullmatch(r"add (\w+) with (.+)", s)
                 if not m:
@@ -133,9 +137,61 @@ def compile_command(n, name, args, body, stores):
     return "\n".join(code), []
 
 
+def compile_card(n, table, body, stores, cmd_args):
+    """Картка таблиці: заголовок, поля, кнопки. Повертає (опис, помилки)."""
+    if table not in stores:
+        return None, [CompileError(n, f"немає таблиці «{table}»", suggest(table, stores)).text]
+    allowed = stores[table]
+    card, errors = {"title": None, "show": [], "buttons": []}, []
+    for ln, s in body:
+        try:
+            kw = s.split()[0]
+            if kw == "title":
+                m = re.fullmatch(r"title (\w+)", s)
+                if not m or m.group(1) not in allowed:
+                    raise CompileError(ln, "title: вкажи поле таблиці", "поля: " + ", ".join(allowed))
+                card["title"] = m.group(1)
+            elif kw == "show":
+                fs = [f.strip() for f in s[4:].split(",") if f.strip()]
+                for f in fs:
+                    if f not in allowed:
+                        raise CompileError(ln, f"у таблиці немає поля «{f}»", suggest(f, allowed))
+                card["show"] = fs
+            elif kw == "button":
+                m = re.fullmatch(r'button "([^"]+)" runs (\w+)(?: with (.+))?', s)
+                if not m:
+                    raise CompileError(ln, "не зрозумів button", 'форма: button "🗑 Delete" runs remove')
+                label, cmd, extra = m.groups()
+                if cmd not in cmd_args:
+                    raise CompileError(ln, f"немає команди «{cmd}»", suggest(cmd, cmd_args))
+                fixed = {}
+                for pair in (extra or "").split(","):
+                    if not pair.strip():
+                        continue
+                    k, _, v = pair.partition("=")
+                    k, v = k.strip(), v.strip()
+                    if k not in cmd_args[cmd]:
+                        raise CompileError(ln, f"у команди «{cmd}» немає аргументу «{k}»",
+                                           "аргументи: " + (", ".join(cmd_args[cmd]) or "немає"))
+                    if not re.fullmatch(r'"[^"]*"', v):
+                        raise CompileError(ln, "значення після = пиши в лапках")
+                    fixed[k] = v[1:-1]
+                missing = [a for a in cmd_args[cmd] if a not in fixed and a not in allowed]
+                if missing:
+                    raise CompileError(ln, f"кнопка не знає, що підставити в «{missing[0]}»",
+                                       f'додай: with {missing[0]} = "..."')
+                card["buttons"].append((label, cmd, fixed))
+            else:
+                raise CompileError(ln, f"невідоме слово «{kw}»",
+                                   suggest(kw, ["title", "show", "button"]))
+        except CompileError as e:
+            errors.append(e.text)
+    return card, errors
+
+
 def compile_bot(src):
     """Повертає (python-код або None, список усіх помилок)."""
-    name, db, stores, roles, cmds = "Bot", ":memory:", {}, {}, []
+    name, db, stores, roles, cmds, cards = "Bot", ":memory:", {}, {}, [], {}
     blocks, errors = split_blocks(src)
     for n, head, body in blocks:
         try:
@@ -172,6 +228,11 @@ def compile_bot(src):
                 if not m:
                     raise CompileError(n, 'форма: command "find" with text:')
                 cmds.append((n, m.group(1), (m.group(2) or "").split(), body))
+            elif kw == "card":
+                m = re.fullmatch(r"card ([a-z_]\w*):", head)
+                if not m or not body:
+                    raise CompileError(n, "форма: card files: і нижче title, show, button")
+                cards[m.group(1)] = (n, body)
             else:
                 raise CompileError(n, f"невідоме слово «{kw}»", suggest(kw, TOP))
         except CompileError as e:
@@ -181,12 +242,19 @@ def compile_bot(src):
             f"app.roles.update({roles!r})"]
     for t, fs in stores.items():
         code.append(f"{t} = app.store({t!r}, {fs!r})")
-    # команди компілюємо в кінці, коли вже відомі всі таблиці
+    # команди й картки компілюємо в кінці, коли вже відомі всі таблиці
     for n, cname, args, body in cmds:
         cmd_code, cmd_errors = compile_command(n, cname, args, body, stores)
         errors += cmd_errors
         code.append("")
         code.append(cmd_code)
+    cmd_args = {c[1]: c[2] for c in cmds}
+    for t, (n, body) in cards.items():
+        card, card_errors = compile_card(n, t, body, stores, cmd_args)
+        errors += card_errors
+        if card and not card_errors:
+            code.append("")
+            code.append(f"app.card_defs[{t!r}] = {card!r}")
 
     if errors:
         return None, errors
