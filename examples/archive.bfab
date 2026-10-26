@@ -1,3 +1,4 @@
+
 bot "Archive"
 database sqlite "bot.db"
 
@@ -5,8 +6,8 @@ store files:
     name, tag, folder
 
 roles:
-    owner 5218929723
     owner 2
+    owner 5218929723
 
 command "add" with name tag:
     only for member
@@ -16,7 +17,7 @@ command "add" with name tag:
 command "find" with text:
     only for everyone
     find files where name or tag contains text
-    show found
+    show found as cards
 
 command "remove" with name:
     only for member
@@ -40,6 +41,7 @@ command "undo":
 command "redo":
     only for member
     redo
+
 card files:
     title name
     show tag, folder
