@@ -2,17 +2,40 @@ bot "Archive"
 database sqlite "bot.db"
 
 store files:
-    name, tag
+    name, tag, folder
 
 roles:
     owner 2
 
 command "add" with name tag:
     only for member
-    add files with name = name, tag = tag
+    add files with name = name, tag = tag, folder = "inbox"
     reply "Додано {name}"
 
 command "find" with text:
     only for everyone
     find files where name or tag contains text
     show found
+
+command "remove" with name:
+    only for member
+    delete files where name is name
+    reply "Видалено {name}. Напиши /undo, щоб повернути."
+
+command "rename" with old new:
+    only for member
+    rename files where name is old to new
+    reply "Тепер файл називається {new}"
+
+command "move" with name folder:
+    only for member
+    move files where name is name to folder
+    reply "{name} переміщено в {folder}"
+
+command "undo":
+    only for member
+    undo
+
+command "redo":
+    only for member
+    redo

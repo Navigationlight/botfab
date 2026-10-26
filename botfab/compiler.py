@@ -3,7 +3,7 @@ import re
 from .common import ROLES, CompileError, suggest
 
 TOP = ["bot", "database", "store", "roles", "command"]
-STATEMENTS = ["only", "find", "show", "add", "reply"]
+STATEMENTS = ["only", "find", "show", "add", "reply", "delete", "rename", "move", "undo", "redo"]
 
 
 def split_blocks(src):
@@ -91,6 +91,26 @@ def compile_command(n, name, args, body, stores):
                                        suggest(ph, args))
             fmt = ", ".join(f"{a}={a}" for a in args)
             out.append(f"await ctx.reply({m.group(1)!r}.format({fmt}))")
+        elif kw == "delete":
+            m = re.fullmatch(r'delete (\w+) where (\w+) is ("[^"]*"|\w+)', s)
+            if not m:
+                raise CompileError(ln, "не зрозумів delete", "форма: delete files where name is name")
+            t, w, a = m.groups()
+            fields([w], table(t, ln), ln)
+            out.append(f"await {t}.delete(ctx, {w!r}, {val(a, ln)})")
+        elif kw in ("rename", "move"):
+            m = re.fullmatch(rf'{kw} (\w+) where (\w+) is ("[^"]*"|\w+) to ("[^"]*"|\w+)', s)
+            if not m:
+                raise CompileError(ln, f"не зрозумів {kw}",
+                                   f"форма: {kw} files where name is name to " + ('new_name' if kw == 'rename' else '"work"'))
+            t, w, a, b = m.groups()
+            field = "name" if kw == "rename" else "folder"
+            fields([w, field], table(t, ln), ln)
+            out.append(f"await {t}.change(ctx, {field!r}, {val(b, ln)}, {w!r}, {val(a, ln)})")
+        elif kw in ("undo", "redo"):
+            if s != kw:
+                raise CompileError(ln, f"після {kw} нічого не пиши")
+            out.append(f"await app.{kw}(ctx)")
         else:
             raise CompileError(ln, f"невідома дія «{kw}»", suggest(kw, STATEMENTS))
 

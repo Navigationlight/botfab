@@ -40,6 +40,30 @@ class Store:
             f"SELECT {','.join(self.fields)} FROM {self.name} WHERE _hidden=0 AND ({where}) LIMIT 20",
             [f"%{text}%"] * len(cols))
 
+    async def delete(self, ctx, where, value):
+        rows = await self.app.run(
+            f"SELECT id FROM {self.name} WHERE _hidden=0 AND {where}=?", [value])
+        if not rows:
+            raise UserError("Нічого не знайдено.")
+        ids = [r[0] for r in rows]
+        mark = ",".join("?" * len(ids))
+        hide = (f"UPDATE {self.name} SET _hidden=1 WHERE id IN ({mark})", ids)
+        show = (f"UPDATE {self.name} SET _hidden=0 WHERE id IN ({mark})", ids)
+        await self.app.run(*hide)
+        self.app.remember(ctx.user_id, [show], [hide])
+
+    async def change(self, ctx, field, new, where, value):
+        rows = await self.app.run(
+            f"SELECT id, {field} FROM {self.name} WHERE _hidden=0 AND {where}=?", [value])
+        if not rows:
+            raise UserError("Нічого не знайдено.")
+        sql = f"UPDATE {self.name} SET {field}=? WHERE id=?"
+        undo = [(sql, [old, i]) for i, old in rows]
+        redo = [(sql, [new, i]) for i, _ in rows]
+        for q, p in redo:
+            await self.app.run(q, p)
+        self.app.remember(ctx.user_id, undo, redo)
+
 
 class Runtime:
     def __init__(self, name, db):
@@ -47,6 +71,9 @@ class Runtime:
         self.conn = sqlite3.connect(db, check_same_thread=False)
         self._lock = asyncio.Lock()
         self._hits = defaultdict(lambda: deque(maxlen=5))
+        self._undo = defaultdict(list)
+        self._redo = defaultdict(list)
+        
 
     def store(self, name, fields):
         return Store(self, name, fields)
@@ -73,6 +100,28 @@ class Runtime:
             return False
         q.append(now)
         return True
+    def remember(self, uid, undo, redo):
+        self._undo[uid].append((undo, redo))
+        self._redo[uid].clear()
+
+    async def undo(self, ctx):
+        if not self._undo[ctx.user_id]:
+            raise UserError("Нічого скасовувати.")
+        undo, redo = self._undo[ctx.user_id].pop()
+        for sql, p in undo:
+            await self.run(sql, p)
+        self._redo[ctx.user_id].append((undo, redo))
+        ctx.out.append("Скасовано.")
+
+    async def redo(self, ctx):
+        if not self._redo[ctx.user_id]:
+            raise UserError("Нічого повертати.")
+        undo, redo = self._redo[ctx.user_id].pop()
+        for sql, p in redo:
+            await self.run(sql, p)
+        self._undo[ctx.user_id].append((undo, redo))
+        ctx.out.append("Повернуто.")
+
 
     async def handle(self, uid, text):
         ctx = Ctx(uid, self.roles.get(uid, "guest"))
