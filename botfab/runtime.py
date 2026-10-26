@@ -1,4 +1,5 @@
 import asyncio
+import datetime as dt
 import logging
 import sqlite3
 import time
@@ -6,6 +7,7 @@ import uuid
 from collections import defaultdict, deque
 
 from .common import ROLES, UserError
+from .scheduler import Scheduler
 
 log = logging.getLogger("botfab")
 
@@ -20,6 +22,11 @@ class Msg:
         return self.text
 
 
+def rows_text(rows):
+    return ("\n".join("• " + " | ".join(map(str, r)) for r in rows)
+            if rows else "Нічого не знайдено.")
+
+
 class Ctx:
     """Відповіді збираються тут; адаптер платформи сам вирішує, як їх показати."""
 
@@ -30,9 +37,7 @@ class Ctx:
         self.out.append(Msg(text, buttons))
 
     async def show(self, rows, buttons=None):
-        text = ("\n".join("• " + " | ".join(map(str, r)) for r in rows)
-                if rows else "Нічого не знайдено.")
-        self.out.append(Msg(text, buttons))
+        self.out.append(Msg(rows_text(rows), buttons))
 
 
 class Store:
@@ -85,6 +90,9 @@ class Runtime:
         self._hits = defaultdict(lambda: deque(maxlen=5))
         self._undo = defaultdict(list)
         self._redo = defaultdict(list)
+        self.tz = dt.timezone.utc
+        self.notifier = None  # адаптер платформи ставить сюди функцію async (user_id, Msg)
+        self.scheduler = Scheduler(self)
 
     def store(self, name, fields):
         s = Store(self, name, fields)
@@ -97,6 +105,59 @@ class Runtime:
             return fn
         return deco
 
+    # ── час і розклад ──
+    def set_timezone(self, name):
+        from zoneinfo import ZoneInfo
+        self.tz = ZoneInfo(name)
+
+    def now(self):
+        return dt.datetime.now(self.tz)
+
+    def system_ctx(self):
+        return Ctx(0, "owner")
+
+    def schedule(self, spec):
+        def deco(fn):
+            self.scheduler.add(spec, fn, fn.__name__)
+            return fn
+        return deco
+
+    def remind(self, table, field, offsets, at):
+        """Щодня о `at` знаходить записи, дата яких (РРРР-ММ-ДД) настане через N днів."""
+        def deco(fn):
+            store = self.stores[table]
+
+            async def job(ctx):
+                today = self.now().date()
+                for n in offsets:
+                    day = (today + dt.timedelta(days=n)).isoformat()
+                    rows = await self.run(
+                        f"SELECT {','.join(store.fields)} FROM {table} WHERE _hidden=0 AND {field}=?", [day])
+                    for row in rows:
+                        rec = dict(zip(store.fields, row))
+                        rec["days"] = n
+                        await fn(ctx, rec)
+
+            self.scheduler.add(("daily", at), job, fn.__name__)
+            return fn
+        return deco
+
+    async def notify(self, role, text):
+        """Надсилає повідомлення всім із роллю не нижче вказаної."""
+        if self.notifier is None:
+            log.warning("notify: адаптер платформи не підключено")
+            return
+        for uid, r in list(self.roles.items()):
+            if ROLES[r] >= ROLES[role]:
+                try:
+                    await self.notifier(uid, Msg(text))
+                except Exception:
+                    log.exception("notify: не вдалось надіслати user=%s", uid)
+
+    def rows_text(self, rows):
+        return rows_text(rows)
+
+    # ── база ──
     def _exec(self, sql, params=()):
         cur = self.conn.execute(sql, params)
         self.conn.commit()

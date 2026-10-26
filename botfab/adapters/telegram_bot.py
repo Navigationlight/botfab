@@ -16,7 +16,17 @@ def markup(buttons):
 
 
 def run_telegram(core, token):
-    tg = Application.builder().token(token).build()
+    async def post_init(application):
+        async def notifier(uid, m):
+            await application.bot.send_message(chat_id=uid, text=m.text, reply_markup=markup(m.buttons))
+
+        core.notifier = notifier
+        core.scheduler.start()  # розклад стартує, коли Telegram уже запущено
+
+    async def post_shutdown(application):
+        core.scheduler.stop()
+
+    tg = Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
 
     async def send(target, user_id, text):
         text = re.sub(r"^/(\w+)@\w+", r"/\1", text)  # /find@MyBot -> /find

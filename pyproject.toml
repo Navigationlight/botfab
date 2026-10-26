@@ -3,6 +3,7 @@ name = "botfab"
 version = "0.1.0"
 description = "Проста мова для створення ботів"
 requires-python = ">=3.10"
+dependencies = ["python-telegram-bot", "tzdata"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

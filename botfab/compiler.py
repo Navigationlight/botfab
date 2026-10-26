@@ -1,9 +1,14 @@
 import re
+from zoneinfo import ZoneInfo
 
 from .common import ROLES, CompileError, suggest
+from .scheduler import WEEKDAYS
 
-TOP = ["bot", "database", "store", "roles", "command", "card"]
-STATEMENTS = ["only", "find", "show", "add", "reply", "delete", "rename", "move", "undo", "redo"]
+TOP = ["bot", "database", "timezone", "store", "roles", "command", "card", "every", "remind"]
+STATEMENTS = ["only", "find", "show", "add", "reply", "delete", "rename", "move",
+              "undo", "redo", "notify"]
+JOB_STATEMENTS = ["find", "add", "notify"]  # що дозволено в розкладі (every)
+EVERY_HINT = "форми: every day at 18:00 | every monday at 09:00 | every 10 minutes"
 
 
 def split_blocks(src):
@@ -22,8 +27,41 @@ def split_blocks(src):
     return blocks, errors
 
 
-def compile_command(n, name, args, body, stores):
-    """Повертає (код, помилки). Збирає помилки з усіх рядків команди."""
+def parse_time(s, n):
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        raise CompileError(n, f"некоректний час «{s}»", "формат: 18:00 (години 0-23, хвилини 00-59)")
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def parse_every(n, head):
+    m = re.fullmatch(r"every (.*):", head)
+    if not m:
+        raise CompileError(n, "не зрозумів every (в кінці рядка має бути «:»)", EVERY_HINT)
+    spec = m.group(1).strip()
+    m = re.fullmatch(r"day at (\S+)", spec)
+    if m:
+        return ("daily", parse_time(m.group(1), n))
+    m = re.fullmatch(r"(\w+) at (\S+)", spec)
+    if m:
+        day = m.group(1)
+        if day not in WEEKDAYS:
+            raise CompileError(n, f"невідомий день «{day}»",
+                               suggest(day, WEEKDAYS) or "monday, tuesday ... sunday або day")
+        return ("weekly", day, parse_time(m.group(2), n))
+    m = re.fullmatch(r"(?:(\d+) )?minutes?", spec)
+    if m:
+        k = int(m.group(1) or 1)
+        if k < 1:
+            raise CompileError(n, "інтервал має бути від 1 хвилини")
+        return ("interval", k)
+    raise CompileError(n, "не зрозумів every", EVERY_HINT)
+
+
+def compile_command(n, name, args, body, stores, spec=None):
+    """Повертає (код, помилки). Збирає помилки з усіх рядків команди.
+    Якщо задано spec, це завдання за розкладом (every), а не команда."""
+    is_job = spec is not None
     role, out, found, found_table = "member", [], False, None  # за замовчуванням закрито для гостей
     errors = []
 
@@ -47,12 +85,15 @@ def compile_command(n, name, args, body, stores):
                 raise CompileError(ln, f"у таблиці немає поля «{f}»", suggest(f, allowed))
 
     if not body:
-        err = CompileError(n, f"команда «{name}» порожня", "додай хоча б reply \"...\"")
+        err = CompileError(n, f"«{name}» порожнє", "додай хоча б один рядок, наприклад reply \"...\"")
         return "", [err.text]
 
     for ln, s in body:
         try:
             kw = s.split()[0]
+            if is_job and kw in STATEMENTS and kw not in JOB_STATEMENTS:
+                raise CompileError(ln, f"«{kw}» не працює в розкладі",
+                                   "тут можна: " + ", ".join(JOB_STATEMENTS))
             if kw == "only":
                 m = re.fullmatch(r"only for (\w+)", s)
                 who = m.group(1) if m else None
@@ -62,14 +103,14 @@ def compile_command(n, name, args, body, stores):
                     raise CompileError(ln, "ролі немає", "є: everyone, member, owner")
                 role = who
             elif kw == "find":
-                m = re.fullmatch(r"find (\w+) where (\w+(?: or \w+)*) contains (\w+)", s)
+                m = re.fullmatch(r'find (\w+) where (\w+(?: or \w+)*) contains ("[^"]*"|\w+)', s)
                 if not m:
                     raise CompileError(ln, "не зрозумів find",
                                        "форма: find files where name or tag contains text")
                 t, fs, a = m.group(1), m.group(2).split(" or "), m.group(3)
                 fields(fs, table(t, ln), ln)
-                val(a, ln)
-                out.append(f"found = await {t}.search({fs!r}, {a})")
+                v = val(a, ln)
+                out.append(f"found = await {t}.search({fs!r}, {v})")
                 found, found_table = True, t
             elif kw == "show":
                 m = re.fullmatch(r"show found( as cards)?", s)
@@ -102,6 +143,24 @@ def compile_command(n, name, args, body, stores):
                                            suggest(ph, args))
                 fmt = ", ".join(f"{a}={a}" for a in args)
                 out.append(f"await ctx.reply({m.group(1)!r}.format({fmt}))")
+            elif kw == "notify":
+                m = re.fullmatch(r'notify (member|owner) (found|"(.*)")', s)
+                if not m:
+                    raise CompileError(ln, "не зрозумів notify",
+                                       'форми: notify member "текст"  або  notify owner found')
+                who, what, text = m.groups()
+                if what == "found":
+                    if not found:
+                        raise CompileError(ln, "нема що надсилати", "спочатку find, потім: notify member found")
+                    out.append("if found:")
+                    out.append(f"    await app.notify({who!r}, app.rows_text(found))")
+                else:
+                    for ph in re.findall(r"\{(\w+)\}", text):
+                        if ph not in args:
+                            raise CompileError(ln, f"у тексті {{{ph}}}, але такого аргументу немає",
+                                               suggest(ph, args))
+                    fmt = ", ".join(f"{a}={a}" for a in args)
+                    out.append(f"await app.notify({who!r}, {text!r}.format({fmt}))")
             elif kw == "delete":
                 m = re.fullmatch(r'delete (\w+) where (\w+) is ("[^"]*"|\w+)', s)
                 if not m:
@@ -131,8 +190,52 @@ def compile_command(n, name, args, body, stores):
 
     if errors:
         return "", errors
-    code = [f'@app.command("{name}", {args!r}, "{role}")',
-            f"async def cmd_{name}(ctx{''.join(', ' + a for a in args)}):"]
+    if is_job:
+        code = [f"@app.schedule({spec!r})", f"async def job_{name}(ctx):"]
+    else:
+        code = [f'@app.command("{name}", {args!r}, "{role}")',
+                f"async def cmd_{name}(ctx{''.join(', ' + a for a in args)}):"]
+    code += ["    " + c for c in out]
+    return "\n".join(code), []
+
+
+def compile_remind(n, head, body, stores):
+    """remind tasks by due before 5, 3, 1 days at 18:00:  ->  (код, помилки)."""
+    m = re.fullmatch(r"remind (\w+) by (\w+) before (\d+(?:\s*,\s*\d+)*) days?(?: at (\S+?))?:", head)
+    if not m:
+        return "", [CompileError(n, "не зрозумів remind",
+                                 "форма: remind tasks by due before 3, 1 days at 18:00:").text]
+    t, field, offs, at = m.groups()
+    errors = []
+    try:
+        at = parse_time(at or "09:00", n)
+        if t not in stores:
+            raise CompileError(n, f"немає таблиці «{t}»", suggest(t, stores))
+        if field not in stores[t]:
+            raise CompileError(n, f"у таблиці немає поля «{field}»", suggest(field, stores[t]))
+    except CompileError as e:
+        return "", [e.text]
+    allowed = list(stores[t]) + ["days"]
+    if not body:
+        return "", [CompileError(n, "remind порожній", 'додай: notify member "{title} через {days} дн."').text]
+    out = []
+    for ln, s in body:
+        m = re.fullmatch(r'notify (member|owner) "(.*)"', s)
+        if not m:
+            errors.append(CompileError(ln, "у remind можна лише notify",
+                                       'форма: notify member "текст з {полями} і {days}"').text)
+            continue
+        who, text = m.groups()
+        bad = [ph for ph in re.findall(r"\{(\w+)\}", text) if ph not in allowed]
+        if bad:
+            errors.append(CompileError(ln, f"у тексті {{{bad[0]}}}, але такого поля немає",
+                                       suggest(bad[0], allowed) or "поля: " + ", ".join(allowed)).text)
+            continue
+        out.append(f"await app.notify({who!r}, {text!r}.format(**rec))")
+    if errors:
+        return "", errors
+    offsets = [int(x) for x in re.split(r"\s*,\s*", offs)]
+    code = [f"@app.remind({t!r}, {field!r}, {offsets!r}, {at!r})", f"async def remind_{n}(ctx, rec):"]
     code += ["    " + c for c in out]
     return "\n".join(code), []
 
@@ -191,7 +294,8 @@ def compile_card(n, table, body, stores, cmd_args):
 
 def compile_bot(src):
     """Повертає (python-код або None, список усіх помилок)."""
-    name, db, stores, roles, cmds, cards = "Bot", ":memory:", {}, {}, [], {}
+    name, db, tz, stores, roles = "Bot", ":memory:", None, {}, {}
+    cmds, cards, jobs, reminds = [], {}, [], []
     blocks, errors = split_blocks(src)
     for n, head, body in blocks:
         try:
@@ -209,6 +313,16 @@ def compile_bot(src):
                     raise CompileError(n, f"база «{m.group(1)}» ще не підтримується",
                                        "зараз є sqlite")
                 db = m.group(2)
+            elif kw == "timezone":
+                m = re.fullmatch(r'timezone "(.+)"', head)
+                if not m:
+                    raise CompileError(n, 'форма: timezone "Europe/Kyiv"')
+                try:
+                    ZoneInfo(m.group(1))
+                except Exception:
+                    raise CompileError(n, f"невідомий часовий пояс «{m.group(1)}»",
+                                       "приклад: Europe/Kyiv. Якщо назва правильна, виконай: pip install tzdata")
+                tz = m.group(1)
             elif kw == "store":
                 m = re.fullmatch(r"store ([a-z_]\w*):", head)
                 if not m or not body:
@@ -233,6 +347,10 @@ def compile_bot(src):
                 if not m or not body:
                     raise CompileError(n, "форма: card files: і нижче title, show, button")
                 cards[m.group(1)] = (n, body)
+            elif kw == "every":
+                jobs.append((n, parse_every(n, head), body))
+            elif kw == "remind":
+                reminds.append((n, head, body))
             else:
                 raise CompileError(n, f"невідоме слово «{kw}»", suggest(kw, TOP))
         except CompileError as e:
@@ -240,9 +358,11 @@ def compile_bot(src):
 
     code = ["# згенеровано BotFab", f"app = Runtime({name!r}, {db!r})",
             f"app.roles.update({roles!r})"]
+    if tz:
+        code.append(f"app.set_timezone({tz!r})")
     for t, fs in stores.items():
         code.append(f"{t} = app.store({t!r}, {fs!r})")
-    # команди й картки компілюємо в кінці, коли вже відомі всі таблиці
+    # команди, картки й розклад компілюємо в кінці, коли вже відомі всі таблиці
     for n, cname, args, body in cmds:
         cmd_code, cmd_errors = compile_command(n, cname, args, body, stores)
         errors += cmd_errors
@@ -255,6 +375,16 @@ def compile_bot(src):
         if card and not card_errors:
             code.append("")
             code.append(f"app.card_defs[{t!r}] = {card!r}")
+    for n, spec, body in jobs:
+        job_code, job_errors = compile_command(n, str(n), [], body, stores, spec=spec)
+        errors += job_errors
+        code.append("")
+        code.append(job_code)
+    for n, head, body in reminds:
+        r_code, r_errors = compile_remind(n, head, body, stores)
+        errors += r_errors
+        code.append("")
+        code.append(r_code)
 
     if errors:
         return None, errors

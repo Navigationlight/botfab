@@ -1,0 +1,30 @@
+bot "Planner"
+database sqlite "planner.db"
+timezone "Europe/Kyiv"
+
+store tasks:
+    title, due
+
+roles:
+    owner 2
+    owner 123456789
+
+# дата завжди у форматі РРРР-ММ-ДД, наприклад 2026-11-01
+command "task" with due title:
+    only for member
+    add tasks with title = title, due = due
+    reply "Збережено: {title} (до {due})"
+
+command "tasks" with text:
+    only for member
+    find tasks where title contains text
+    show found
+
+# щодня о 18:00: за 3 дні і за 1 день до дати
+remind tasks by due before 3, 1 days at 18:00:
+    notify member "⏰ {title}: залишилось днів {days} (до {due})"
+
+# щодня о 09:00: список усіх задач (якщо вони є)
+every day at 09:00:
+    find tasks where title contains ""
+    notify member found
