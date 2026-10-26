@@ -12,3 +12,12 @@ def test_good_code_compiles():
     py, errors = check(src)
     assert errors == []
     assert "app.command" in py
+def test_all_errors_at_once():
+    src = (
+        'store files:\n    name\n\n'
+        'command "f" with t:\n'
+        '    fnd files where name contains t\n'
+        '    reply "Привіт {x}"\n'
+    )
+    _, errors = check(src)
+    assert len(errors) == 2
