@@ -1,0 +1,18 @@
+bot "Archive"
+database sqlite "bot.db"
+
+store files:
+    name, tag
+
+roles:
+    owner 2
+
+command "add" with name tag:
+    only for member
+    add files with name = name, tag = tag
+    reply "Додано {name}"
+
+command "find" with text:
+    only for everyone
+    find files where name or tag contains text
+    show found
