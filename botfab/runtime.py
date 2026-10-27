@@ -22,8 +22,14 @@ class Msg:
         return self.text
 
 
+def q(name):
+    """Назва таблиці/поля в лапках для SQL (захист від зарезервованих слів)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 def rows_text(rows):
-    return ("\n".join("• " + " | ".join(map(str, r)) for r in rows)
+    """Перший стовпець кожного рядка це id запису: показуємо його як #id."""
+    return ("\n".join(f"• #{r[0]} " + " | ".join(map(str, r[1:])) for r in rows)
             if rows else "Нічого не знайдено.")
 
 
@@ -41,43 +47,76 @@ class Ctx:
 
 
 class Store:
-    def __init__(self, app, name, fields):
-        self.app, self.name, self.fields = app, name, fields
-        cols = ", ".join(f"{f} TEXT" for f in fields)
-        app._exec(f"CREATE TABLE IF NOT EXISTS {name} (id INTEGER PRIMARY KEY, {cols}, _hidden INTEGER DEFAULT 0)")
+    def __init__(self, app, name, fields, unique=()):
+        self.app, self.name, self.fields, self.unique = app, name, fields, list(unique)
+        cols = ", ".join(f"{q(f)} TEXT" for f in fields)
+        app._exec(f"CREATE TABLE IF NOT EXISTS {q(name)} "
+                  f"(id INTEGER PRIMARY KEY, {cols}, _hidden INTEGER DEFAULT 0)")
+        # автоміграція: нові поля з .bfab додаються до наявної таблиці, дані лишаються
+        have = {r[1] for r in app._exec(f"PRAGMA table_info({q(name)})")}
+        if "_hidden" not in have:
+            app._exec(f"ALTER TABLE {q(name)} ADD COLUMN _hidden INTEGER DEFAULT 0")
+        for f in fields:
+            if f not in have:
+                app._exec(f"ALTER TABLE {q(name)} ADD COLUMN {q(f)} TEXT")
+                log.info("міграція: у таблицю %s додано поле %s", name, f)
+        self._sync_unique()
+
+    def _sync_unique(self):
+        """Унікальність тримається індексом у базі (надійно навіть при одночасних запитах)."""
+        prefix = f"ux:{self.name}:"
+        old = [r[0] for r in self.app._exec(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'ux:%'")]
+        for ix in old:
+            if ix.startswith(prefix) and ix[len(prefix):] not in self.unique:
+                self.app._exec(f"DROP INDEX {q(ix)}")
+        for f in self.unique:
+            try:
+                self.app._exec(f"CREATE UNIQUE INDEX IF NOT EXISTS {q(prefix + f)} "
+                               f"ON {q(self.name)} ({q(f)}) WHERE _hidden=0")
+            except sqlite3.IntegrityError:
+                log.warning("У таблиці %s вже є дублікати в полі %s: індекс не створено, "
+                            "унікальність перевіряється лише при додаванні. "
+                            "Видали дублікати й перезапусти бота.", self.name, f)
 
     async def add(self, **v):
+        for f in self.unique:
+            if f in v and await self.app.run(
+                    f"SELECT id FROM {q(self.name)} WHERE _hidden=0 AND {q(f)}=?", [v[f]]):
+                raise UserError(f"Такий запис уже є: {f} = {v[f]}")
         ph = ",".join("?" * len(v))
-        await self.app.run(f"INSERT INTO {self.name} ({','.join(v)}) VALUES ({ph})", list(v.values()))
+        await self.app.run(
+            f"INSERT INTO {q(self.name)} ({','.join(q(c) for c in v)}) VALUES ({ph})", list(v.values()))
 
     async def search(self, cols, text):
-        where = " OR ".join(f"{c} LIKE ?" for c in cols)
+        """Повертає рядки (id, поле1, поле2, ...)."""
+        where = " OR ".join(f"{q(c)} LIKE ?" for c in cols)
         return await self.app.run(
-            f"SELECT {','.join(self.fields)} FROM {self.name} WHERE _hidden=0 AND ({where}) LIMIT 20",
+            f"SELECT id, {','.join(q(f) for f in self.fields)} FROM {q(self.name)} "
+            f"WHERE _hidden=0 AND ({where}) ORDER BY id LIMIT 20",
             [f"%{text}%"] * len(cols))
 
     async def delete(self, ctx, where, value):
         rows = await self.app.run(
-            f"SELECT id FROM {self.name} WHERE _hidden=0 AND {where}=?", [value])
+            f"SELECT id FROM {q(self.name)} WHERE _hidden=0 AND {q(where)}=?", [value])
         if not rows:
             raise UserError("Нічого не знайдено.")
         ids = [r[0] for r in rows]
         mark = ",".join("?" * len(ids))
-        hide = (f"UPDATE {self.name} SET _hidden=1 WHERE id IN ({mark})", ids)
-        show = (f"UPDATE {self.name} SET _hidden=0 WHERE id IN ({mark})", ids)
+        hide = (f"UPDATE {q(self.name)} SET _hidden=1 WHERE id IN ({mark})", ids)
+        show = (f"UPDATE {q(self.name)} SET _hidden=0 WHERE id IN ({mark})", ids)
         await self.app.run(*hide)
         self.app.remember(ctx.user_id, [show], [hide])
 
     async def change(self, ctx, field, new, where, value):
         rows = await self.app.run(
-            f"SELECT id, {field} FROM {self.name} WHERE _hidden=0 AND {where}=?", [value])
+            f"SELECT id, {q(field)} FROM {q(self.name)} WHERE _hidden=0 AND {q(where)}=?", [value])
         if not rows:
             raise UserError("Нічого не знайдено.")
-        sql = f"UPDATE {self.name} SET {field}=? WHERE id=?"
+        sql = f"UPDATE {q(self.name)} SET {q(field)}=? WHERE id=?"
         undo = [(sql, [old, i]) for i, old in rows]
         redo = [(sql, [new, i]) for i, _ in rows]
-        for q, p in redo:
-            await self.app.run(q, p)
+        await self.app.run_many(redo)  # усе або нічого
         self.app.remember(ctx.user_id, undo, redo)
 
 
@@ -86,16 +125,18 @@ class Runtime:
         self.name, self.roles, self.commands = name, {}, {}
         self.stores, self.card_defs = {}, {}
         self.conn = sqlite3.connect(db, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")    # швидший запис, читання не блокує запис
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self._lock = asyncio.Lock()
         self._hits = defaultdict(lambda: deque(maxlen=5))
-        self._undo = defaultdict(list)
-        self._redo = defaultdict(list)
+        self._undo = defaultdict(lambda: deque(maxlen=50))  # пам'ятаємо 50 останніх дій
+        self._redo = defaultdict(lambda: deque(maxlen=50))
         self.tz = dt.timezone.utc
         self.notifier = None  # адаптер платформи ставить сюди функцію async (user_id, Msg)
         self.scheduler = Scheduler(self)
 
-    def store(self, name, fields):
-        s = Store(self, name, fields)
+    def store(self, name, fields, unique=()):
+        s = Store(self, name, fields, unique)
         self.stores[name] = s
         return s
 
@@ -132,9 +173,10 @@ class Runtime:
                 for n in offsets:
                     day = (today + dt.timedelta(days=n)).isoformat()
                     rows = await self.run(
-                        f"SELECT {','.join(store.fields)} FROM {table} WHERE _hidden=0 AND {field}=?", [day])
+                        f"SELECT id, {','.join(q(f) for f in store.fields)} FROM {q(table)} "
+                        f"WHERE _hidden=0 AND {q(field)}=?", [day])
                     for row in rows:
-                        rec = dict(zip(store.fields, row))
+                        rec = dict(zip(["id"] + store.fields, row))
                         rec["days"] = n
                         await fn(ctx, rec)
 
@@ -163,10 +205,30 @@ class Runtime:
         self.conn.commit()
         return cur.fetchall()
 
+    def _exec_many(self, stmts):
+        try:
+            for sql, params in stmts:
+                self.conn.execute(sql, params)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
     async def run(self, sql, params=()):
         # база не блокує бота: запит іде в окремому потоці, запити йдуть по черзі
         async with self._lock:
-            return await asyncio.to_thread(self._exec, sql, params)
+            try:
+                return await asyncio.to_thread(self._exec, sql, params)
+            except sqlite3.IntegrityError:
+                raise UserError("Не вийшло: таке значення вже є (поле має бути унікальним).")
+
+    async def run_many(self, stmts):
+        """Кілька запитів в одній транзакції: або всі виконаються, або жоден."""
+        async with self._lock:
+            try:
+                await asyncio.to_thread(self._exec_many, stmts)
+            except sqlite3.IntegrityError:
+                raise UserError("Не вийшло: таке значення вже є (поле має бути унікальним).")
 
     def _allowed(self, uid):  # не більше 5 команд за 10 с
         q, now = self._hits[uid], time.monotonic()
@@ -182,18 +244,18 @@ class Runtime:
     async def undo(self, ctx):
         if not self._undo[ctx.user_id]:
             raise UserError("Нічого скасовувати.")
-        undo, redo = self._undo[ctx.user_id].pop()
-        for sql, p in undo:
-            await self.run(sql, p)
+        undo, redo = self._undo[ctx.user_id][-1]
+        await self.run_many(undo)  # якщо не вийшло, запис дії лишається в історії
+        self._undo[ctx.user_id].pop()
         self._redo[ctx.user_id].append((undo, redo))
         ctx.out.append(Msg("Скасовано."))
 
     async def redo(self, ctx):
         if not self._redo[ctx.user_id]:
             raise UserError("Нічого повертати.")
-        undo, redo = self._redo[ctx.user_id].pop()
-        for sql, p in redo:
-            await self.run(sql, p)
+        undo, redo = self._redo[ctx.user_id][-1]
+        await self.run_many(redo)
+        self._redo[ctx.user_id].pop()
         self._undo[ctx.user_id].append((undo, redo))
         ctx.out.append(Msg("Повернуто."))
 
@@ -202,7 +264,7 @@ class Runtime:
         card = self.card_defs.get(table)
         if not card or not rows:
             return await ctx.show(rows)
-        fields = self.stores[table].fields
+        fields = ["id"] + self.stores[table].fields
         for row in rows[:5]:
             rec = dict(zip(fields, row))
             lines = [f"{f}: {rec[f]}" for f in card["show"]]

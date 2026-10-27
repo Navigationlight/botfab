@@ -167,7 +167,7 @@ def compile_command(n, name, args, body, stores, spec=None):
                     raise CompileError(ln, "не зрозумів delete",
                                        "форма: delete files where name is name")
                 t, w, a = m.groups()
-                fields([w], table(t, ln), ln)
+                fields([w], table(t, ln) + ["id"], ln)
                 out.append(f"await {t}.delete(ctx, {w!r}, {val(a, ln)})")
             elif kw in ("rename", "move"):
                 m = re.fullmatch(rf'{kw} (\w+) where (\w+) is ("[^"]*"|\w+) to ("[^"]*"|\w+)', s)
@@ -177,7 +177,8 @@ def compile_command(n, name, args, body, stores, spec=None):
                                        f"форма: {kw} files where name is name to {ex}")
                 t, w, a, b = m.groups()
                 field = "name" if kw == "rename" else "folder"
-                fields([w, field], table(t, ln), ln)
+                fields([w], table(t, ln) + ["id"], ln)
+                fields([field], table(t, ln), ln)
                 out.append(f"await {t}.change(ctx, {field!r}, {val(b, ln)}, {w!r}, {val(a, ln)})")
             elif kw in ("undo", "redo"):
                 if s != kw:
@@ -215,7 +216,7 @@ def compile_remind(n, head, body, stores):
             raise CompileError(n, f"у таблиці немає поля «{field}»", suggest(field, stores[t]))
     except CompileError as e:
         return "", [e.text]
-    allowed = list(stores[t]) + ["days"]
+    allowed = ["id"] + list(stores[t]) + ["days"]
     if not body:
         return "", [CompileError(n, "remind порожній", 'додай: notify member "{title} через {days} дн."').text]
     out = []
@@ -244,7 +245,7 @@ def compile_card(n, table, body, stores, cmd_args):
     """Картка таблиці: заголовок, поля, кнопки. Повертає (опис, помилки)."""
     if table not in stores:
         return None, [CompileError(n, f"немає таблиці «{table}»", suggest(table, stores)).text]
-    allowed = stores[table]
+    allowed = ["id"] + stores[table]
     card, errors = {"title": None, "show": [], "buttons": []}, []
     for ln, s in body:
         try:
@@ -295,6 +296,7 @@ def compile_card(n, table, body, stores, cmd_args):
 def compile_bot(src):
     """Повертає (python-код або None, список усіх помилок)."""
     name, db, tz, stores, roles = "Bot", ":memory:", None, {}, {}
+    uniques = {}
     cmds, cards, jobs, reminds = [], {}, [], []
     blocks, errors = split_blocks(src)
     for n, head, body in blocks:
@@ -327,8 +329,33 @@ def compile_bot(src):
                 m = re.fullmatch(r"store ([a-z_]\w*):", head)
                 if not m or not body:
                     raise CompileError(n, "форма: store files: і нижче поля через кому")
-                fs = [f.split("=")[0].strip() for _, l in body for f in l.split(",")]
+                fs, uniq = [], []
+                for ln, l in body:
+                    for tok in l.split(","):
+                        words = tok.split()
+                        if not words:
+                            continue
+                        fname, mods = words[0], words[1:]
+                        if not re.fullmatch(r"[a-z][a-z0-9_]*", fname):
+                            errors.append(CompileError(
+                                ln, f"некоректна назва поля «{fname}»",
+                                "латинські малі літери, цифри і _; починай з літери").text)
+                            continue
+                        if fname == "id" or fname in fs:
+                            errors.append(CompileError(
+                                ln, f"поле «{fname}» " + ("зарезервоване (id є в кожної таблиці)"
+                                                          if fname == "id" else "вже є")).text)
+                            continue
+                        for mod in mods:
+                            if mod == "unique":
+                                uniq.append(fname)
+                            else:
+                                errors.append(CompileError(
+                                    ln, f"невідома властивість «{mod}»",
+                                    suggest(mod, ["unique"]) or "є: unique").text)
+                        fs.append(fname)
                 stores[m.group(1)] = fs
+                uniques[m.group(1)] = uniq
             elif kw == "roles":
                 for ln, l in body:
                     m = re.fullmatch(r"(owner|member) (\d+)", l)
@@ -361,7 +388,7 @@ def compile_bot(src):
     if tz:
         code.append(f"app.set_timezone({tz!r})")
     for t, fs in stores.items():
-        code.append(f"{t} = app.store({t!r}, {fs!r})")
+        code.append(f"{t} = app.store({t!r}, {fs!r}, {uniques[t]!r})")
     # команди, картки й розклад компілюємо в кінці, коли вже відомі всі таблиці
     for n, cname, args, body in cmds:
         cmd_code, cmd_errors = compile_command(n, cname, args, body, stores)

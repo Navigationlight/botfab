@@ -5,13 +5,34 @@ from botfab.compiler import check
 from botfab.runtime import Runtime
 
 
-def build(path="examples/planner.bfab"):
-    src = open(path, encoding="utf-8").read().replace('"planner.db"', '":memory:"')
+PLANNER = (
+    'timezone "Europe/Kyiv"\n'
+    'store tasks:\n    title, due\n\n'
+    'roles:\n    owner 2\n\n'
+    'command "task" with due title:\n'
+    '    add tasks with title = title, due = due\n'
+    '    reply "ok"\n\n'
+    'remind tasks by due before 3, 1 days at 18:00:\n'
+    '    notify member "⏰ {title}: залишилось днів {days} (до {due})"\n\n'
+    'every day at 09:00:\n'
+    '    find tasks where title contains ""\n'
+    '    notify member found\n'
+)
+
+
+def build(src=PLANNER):
+    """Тести будують бота зі свого тексту і не залежать від файлів у examples/."""
     py, errors = check(src)
     assert errors == [], errors
     ns = {"Runtime": Runtime}
     exec(py, ns)
     return ns["app"]
+
+
+def test_examples_compile():
+    for name in ("archive", "planner"):
+        _, errors = check(open(f"examples/{name}.bfab", encoding="utf-8").read())
+        assert errors == [], (name, errors)
 
 
 def test_planner_compiles():

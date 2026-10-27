@@ -3,7 +3,7 @@ bot "Archive"
 database sqlite "bot.db"
 
 store files:
-    name, tag, folder
+    name unique, tag, folder
 
 roles:
     owner 2
