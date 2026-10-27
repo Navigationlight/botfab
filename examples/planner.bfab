@@ -2,6 +2,10 @@ bot "Planner"
 database sqlite "planner.db"
 timezone "Europe/Kyiv"
 
+setting remind_at: time = 18:00
+setting remind_days: days = 3, 1
+setting digest_at: time = 09:00
+setting greeting: text = "Привіт"
 store tasks:
     title, due
 
@@ -25,10 +29,9 @@ command "done" with id:
     reply "Готово. Напиши /undo, щоб повернути."
 
 # щодня о 18:00: за 3 дні і за 1 день до дати
-remind tasks by due before 3, 1 days at 02:46:
-    notify member "⏰ {title}: залишилось днів {days} (до {due})"
+remind tasks by due before setting.remind_days days at setting.remind_at:
+    notify me "⏰ {setting.greeting}! {title}: залишилось днів {days} (до {due})"
 
-# щодня о 09:00: список усіх задач (якщо вони є)
-every day at 02:49:
+every day at setting.digest_at:
     find tasks where title contains ""
-    notify member found
+    notify me found

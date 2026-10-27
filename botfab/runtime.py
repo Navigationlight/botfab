@@ -8,6 +8,7 @@ from collections import defaultdict, deque
 
 from .common import ROLES, UserError
 from .scheduler import Scheduler
+from .settings import HINTS, days_list, parse_value
 
 log = logging.getLogger("botfab")
 
@@ -31,6 +32,21 @@ def rows_text(rows):
     """Перший стовпець кожного рядка це id запису: показуємо його як #id."""
     return ("\n".join(f"• #{r[0]} " + " | ".join(map(str, r[1:])) for r in rows)
             if rows else "Нічого не знайдено.")
+
+
+class Settings:
+    """Налаштування одного користувача: у тексті пишемо {setting.назва}."""
+
+    def __init__(self, app, uid):
+        self._app, self._uid = app, uid
+
+    def __getattr__(self, key):
+        if key.startswith("_"):
+            raise AttributeError(key)
+        try:
+            return self._app.setting_value(self._uid, key)
+        except KeyError:
+            raise AttributeError(key)
 
 
 class Ctx:
@@ -134,6 +150,7 @@ class Runtime:
         self.tz = dt.timezone.utc
         self.notifier = None  # адаптер платформи ставить сюди функцію async (user_id, Msg)
         self.scheduler = Scheduler(self)
+        self._defs, self._values = {}, {}  # налаштування: означення і значення користувачів
 
     def store(self, name, fields, unique=()):
         s = Store(self, name, fields, unique)
@@ -154,23 +171,82 @@ class Runtime:
     def now(self):
         return dt.datetime.now(self.tz)
 
+    def user_ctx(self, uid):
+        return Ctx(uid, self.roles.get(uid, "owner" if uid == 0 else "guest"))
+
     def system_ctx(self):
-        return Ctx(0, "owner")
+        return self.user_ctx(0)
+
+    def members(self):
+        """Усі, хто має роль member або вище: [(id, роль)]."""
+        return [(u, r) for u, r in self.roles.items() if ROLES[r] >= ROLES["member"]]
+
+    # ── налаштування користувачів ──
+    def define_setting(self, key, kind, default):
+        if not self._defs:  # перше налаштування: таблиця, завантаження й команди /settings, /set
+            self._exec("CREATE TABLE IF NOT EXISTS _settings "
+                       "(user_id INTEGER, key TEXT, value TEXT, PRIMARY KEY (user_id, key))")
+            for uid, k, v in self._exec("SELECT user_id, key, value FROM _settings"):
+                self._values[(uid, k)] = v
+            self.command("settings", [], "member")(self._cmd_settings)
+            self.command("set", ["name", "value"], "member")(self._cmd_set)
+        self._defs[key] = {"kind": kind, "default": default}
+
+    def setting_value(self, uid, key):
+        d = self._defs[key]  # KeyError, якщо такого налаштування немає
+        v = self._values.get((uid, key))
+        if v is None:
+            return d["default"]
+        try:
+            return parse_value(d["kind"], v)
+        except ValueError:  # старе значення не підходить під поточний тип
+            return d["default"]
+
+    def settings(self, uid):
+        return Settings(self, uid)
+
+    async def _cmd_settings(self, ctx):
+        lines, buttons = ["Твої налаштування:"], []
+        for key, d in self._defs.items():
+            lines.append(f"• {key} = {self.setting_value(ctx.user_id, key)}   ({HINTS[d['kind']]})")
+            buttons.append((f"↩ {key}", f"/set {key} {d['default']}"))
+        lines.append("\nЗмінити: /set назва значення\nКнопка ↩ повертає стандартне значення.")
+        ctx.out.append(Msg("\n".join(lines), [buttons[i:i + 2] for i in range(0, len(buttons), 2)]))
+
+    async def _cmd_set(self, ctx, name, value):
+        name = name.lower()
+        if name not in self._defs:
+            raise UserError(f"Немає налаштування «{name}». Є: " + ", ".join(self._defs))
+        try:
+            value = parse_value(self._defs[name]["kind"], value)
+        except ValueError as e:
+            raise UserError(str(e))
+        await self.run("INSERT OR REPLACE INTO _settings (user_id, key, value) VALUES (?, ?, ?)",
+                       [ctx.user_id, name, value])
+        self._values[(ctx.user_id, name)] = value
+        ctx.out.append(Msg(f"Збережено: {name} = {value}"))
 
     def schedule(self, spec):
+        personal = spec[0] != "interval" and spec[-1].startswith("@")
+
         def deco(fn):
-            self.scheduler.add(spec, fn, fn.__name__)
+            self.scheduler.add(spec, fn, fn.__name__, personal)
             return fn
         return deco
 
     def remind(self, table, field, offsets, at):
-        """Щодня о `at` знаходить записи, дата яких (РРРР-ММ-ДД) настане через N днів."""
+        """Щодня о `at` знаходить записи, дата яких (РРРР-ММ-ДД) настане через N днів.
+        offsets і at можуть бути "@назва" (беруться з налаштувань користувача)."""
+        personal = isinstance(offsets, str) or at.startswith("@")
+
         def deco(fn):
             store = self.stores[table]
 
             async def job(ctx):
                 today = self.now().date()
-                for n in offsets:
+                offs = days_list(self.setting_value(ctx.user_id, offsets[1:])) \
+                    if isinstance(offsets, str) else offsets
+                for n in offs:
                     day = (today + dt.timedelta(days=n)).isoformat()
                     rows = await self.run(
                         f"SELECT id, {','.join(q(f) for f in store.fields)} FROM {q(table)} "
@@ -180,21 +256,32 @@ class Runtime:
                         rec["days"] = n
                         await fn(ctx, rec)
 
-            self.scheduler.add(("daily", at), job, fn.__name__)
+            self.scheduler.add(("daily", at), job, fn.__name__, personal)
             return fn
         return deco
 
-    async def notify(self, role, text):
-        """Надсилає повідомлення всім із роллю не нижче вказаної."""
+    def _fmt(self, uid, text, kw):
+        try:
+            return text.format(**kw, setting=self.settings(uid))
+        except Exception:
+            log.exception("notify: помилка в тексті «%s»", text)
+            return text
+
+    async def notify_user(self, uid, text, **kw):
+        """Надсилає повідомлення одній людині (текст підставляє її налаштування)."""
         if self.notifier is None:
             log.warning("notify: адаптер платформи не підключено")
             return
+        try:
+            await self.notifier(uid, Msg(self._fmt(uid, text, kw)))
+        except Exception:
+            log.exception("notify: не вдалось надіслати user=%s", uid)
+
+    async def notify(self, role, text, **kw):
+        """Надсилає повідомлення всім із роллю не нижче вказаної."""
         for uid, r in list(self.roles.items()):
             if ROLES[r] >= ROLES[role]:
-                try:
-                    await self.notifier(uid, Msg(text))
-                except Exception:
-                    log.exception("notify: не вдалось надіслати user=%s", uid)
+                await self.notify_user(uid, text, **kw)
 
     def rows_text(self, rows):
         return rows_text(rows)

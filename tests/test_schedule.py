@@ -113,7 +113,7 @@ def test_interval_and_weekly():
         app.scheduler.start()  # задає старт відліку для interval
         for j in app.scheduler.jobs:
             if j["spec"][0] == "interval":
-                j["last"] = 0.0
+                j["last"] = {0: 0.0}
         monday = dt.datetime(2026, 10, 26, 8, 0, tzinfo=dt.timezone.utc)  # понеділок
         tuesday = dt.datetime(2026, 10, 27, 8, 0, tzinfo=dt.timezone.utc)
         app.scheduler.stop()
